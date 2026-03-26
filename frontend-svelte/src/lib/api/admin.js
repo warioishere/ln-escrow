@@ -81,6 +81,57 @@ export async function updateFees(pubkey, serviceFeePercent) {
 	});
 }
 
+export async function searchDeals(pubkey, params = {}) {
+	const query = new URLSearchParams();
+	if (params.title) query.set('title', params.title);
+	if (params.status) query.set('status_filter', params.status);
+	if (params.minSats) query.set('min_sats', params.minSats);
+	if (params.maxSats) query.set('max_sats', params.maxSats);
+	if (params.createdAfter) query.set('created_after', params.createdAfter);
+	if (params.createdBefore) query.set('created_before', params.createdBefore);
+	if (params.limit) query.set('limit', params.limit);
+	return request(`/deals/search?${query}`, {
+		headers: adminHeaders(null, pubkey)
+	});
+}
+
+export async function adminBulkResolve(pubkey, dealIds, resolution, note = null) {
+	return request('/deals/admin/bulk/resolve', {
+		method: 'POST',
+		headers: adminHeaders(null, pubkey),
+		body: JSON.stringify({ deal_ids: dealIds, resolution, resolution_note: note })
+	});
+}
+
+export async function adminBulkRetryPayouts(pubkey, dealIds = null) {
+	return request('/deals/admin/bulk/retry-payouts', {
+		method: 'POST',
+		headers: adminHeaders(null, pubkey),
+		body: JSON.stringify(dealIds ? { deal_ids: dealIds } : {})
+	});
+}
+
+export async function adminRegisterWebhook(pubkey, url, secret = null, events = null) {
+	return request('/deals/admin/webhooks', {
+		method: 'POST',
+		headers: adminHeaders(null, pubkey),
+		body: JSON.stringify({ url, secret, events })
+	});
+}
+
+export async function adminListWebhooks(pubkey) {
+	return request('/deals/admin/webhooks', {
+		headers: adminHeaders(null, pubkey)
+	});
+}
+
+export async function adminDeleteWebhook(pubkey, webhookId) {
+	return request(`/deals/admin/webhooks/${webhookId}`, {
+		method: 'DELETE',
+		headers: adminHeaders(null, pubkey)
+	});
+}
+
 export async function getAdminChallenge() {
 	return request('/auth/lnurl/admin/challenge');
 }

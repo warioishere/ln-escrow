@@ -314,17 +314,26 @@ async def cancel_dispute(deal_id: str, body: CancelDisputeRequest):
     previous_status = DealStatus.SHIPPED.value if deal.get('shipped_at') else DealStatus.FUNDED.value
 
     try:
-        updated_deal = deal_storage.update_deal(
+        transitioned = deal_storage.atomic_status_transition(
             deal_id,
-            status=previous_status,
+            [DealStatus.DISPUTED.value],
+            previous_status,
             disputed_at=None,
             disputed_by=None,
-            dispute_reason=None
+            dispute_reason=None,
         )
+        if not transitioned:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Deal state changed concurrently. Please refresh and try again."
+            )
+        updated_deal = deal_storage.get_deal_by_id(deal_id)
         logger.info("Dispute cancelled for deal %s by %s, returning to %s", deal_id, body.user_id, previous_status)
         await _ws_notify(deal_id, 'deal:dispute-cancelled')
         return deal_to_response(updated_deal)
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Failed to cancel dispute for deal %s: %s", deal_id, e)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal error. Please try again.")

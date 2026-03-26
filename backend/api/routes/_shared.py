@@ -15,11 +15,16 @@ logger = logging.getLogger(__name__)
 
 
 async def _ws_notify(deal_id: str, event: str, data: dict = None):
-    """Send WebSocket notification (fire-and-forget, never raises)."""
+    """Send WebSocket + webhook notifications (fire-and-forget, never raises)."""
     try:
         await ws_manager.broadcast(deal_id, event, data)
     except Exception as e:
         logger.debug("WebSocket notification failed: %s", e)
+    try:
+        from backend.webhooks import deliver_webhook_event
+        await deliver_webhook_event(event, deal_id, data)
+    except Exception as e:
+        logger.debug("Webhook delivery failed: %s", e)
 
 
 def verify_admin(

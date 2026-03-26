@@ -1,13 +1,15 @@
 """
 Admin endpoints: config, list-all-deals, disputes, ledger,
-resolve-release, resolve-refund, retry-payout,
+resolve-release, resolve-refund, retry-payout, bulk operations,
 limits, fees, cancel-deal.
 """
+import asyncio
 import logging
 import os
 from typing import Optional
 from datetime import datetime, timezone
 from fastapi import APIRouter, Request, HTTPException, status, Header
+from pydantic import BaseModel, Field
 
 from backend.database import deal_storage
 from backend.database.models import DealStatus
@@ -638,5 +640,180 @@ async def admin_escrow_status(
     except Exception as e:
         logger.error("Failed to query escrow %s for deal %s: %s", escrow_id, deal_id, e)
         return {"deal_id": deal_id, "escrow_id": escrow_id, "error": "Failed to query escrow state"}
+
+
+# ============================================================================
+# Bulk Operations
+# ============================================================================
+
+# ============================================================================
+# Webhooks
+# ============================================================================
+
+class RegisterWebhookRequest(BaseModel):
+    """Request to register a webhook endpoint."""
+    url: str = Field(..., min_length=10, max_length=500, description="Target URL for webhook delivery")
+    secret: Optional[str] = Field(None, max_length=200, description="Shared secret for HMAC-SHA256 signature")
+    events: Optional[list[str]] = Field(None, description="Event filter (e.g. ['deal:funded', 'deal:completed']). Omit for all events.")
+
+
+@router.post("/admin/webhooks")
+async def admin_register_webhook(
+    body: RegisterWebhookRequest,
+    x_admin_key: Optional[str] = Header(None),
+    x_admin_pubkey: Optional[str] = Header(None),
+):
+    """Register a webhook endpoint for deal event notifications."""
+    verify_admin(x_admin_key, x_admin_pubkey)
+
+    if not body.url.startswith("https://"):
+        raise HTTPException(status_code=400, detail="Webhook URL must use HTTPS")
+
+    from backend.webhooks import register_webhook
+    webhook = register_webhook(url=body.url, secret=body.secret, events=body.events)
+    log_admin_action("register_webhook", f"url={body.url}")
+    return {"success": True, "webhook": webhook}
+
+
+@router.get("/admin/webhooks")
+async def admin_list_webhooks(
+    x_admin_key: Optional[str] = Header(None),
+    x_admin_pubkey: Optional[str] = Header(None),
+):
+    """List all registered webhooks (secrets redacted)."""
+    verify_admin(x_admin_key, x_admin_pubkey)
+    from backend.webhooks import list_webhooks
+    webhooks = list_webhooks()
+    return {"webhooks": webhooks, "count": len(webhooks)}
+
+
+@router.delete("/admin/webhooks/{webhook_id}")
+async def admin_delete_webhook(
+    webhook_id: str,
+    x_admin_key: Optional[str] = Header(None),
+    x_admin_pubkey: Optional[str] = Header(None),
+):
+    """Remove a registered webhook."""
+    verify_admin(x_admin_key, x_admin_pubkey)
+    from backend.webhooks import unregister_webhook
+    removed = unregister_webhook(webhook_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="Webhook not found")
+    log_admin_action("delete_webhook", f"id={webhook_id}")
+    return {"success": True}
+
+
+class BulkResolveRequest(BaseModel):
+    """Request to resolve multiple disputed deals at once."""
+    deal_ids: list[str] = Field(..., min_length=1, max_length=50, description="List of deal IDs to resolve")
+    resolution: str = Field(..., pattern='^(release|refund)$', description="Resolution type")
+    resolution_note: Optional[str] = Field(None, max_length=500)
+
+
+class BulkRetryPayoutsRequest(BaseModel):
+    """Request to retry failed payouts for multiple deals."""
+    deal_ids: list[str] = Field(default=None, max_length=50, description="Specific deal IDs, or omit to retry all failed")
+
+
+@router.post("/admin/bulk/resolve")
+async def admin_bulk_resolve(
+    request: Request,
+    body: BulkResolveRequest,
+    x_admin_key: Optional[str] = Header(None),
+    x_admin_pubkey: Optional[str] = Header(None),
+):
+    """
+    Resolve multiple disputed deals in one call.
+
+    Each deal is resolved independently — failures in one don't affect others.
+    Returns per-deal results.
+    """
+    verify_admin(x_admin_key, x_admin_pubkey)
+    log_admin_action("bulk_resolve", f"{len(body.deal_ids)} deals → {body.resolution}", request)
+
+    results = []
+    for deal_id in body.deal_ids:
+        try:
+            resolve_body = ResolveDisputeRequest(resolution_note=body.resolution_note)
+            result = await _admin_resolve_dispute(
+                deal_id, body.resolution, request, resolve_body,
+                x_admin_key, x_admin_pubkey,
+            )
+            results.append({"deal_id": deal_id, "success": True, "result": result})
+        except HTTPException as e:
+            results.append({"deal_id": deal_id, "success": False, "error": e.detail})
+        except Exception as e:
+            results.append({"deal_id": deal_id, "success": False, "error": str(e)})
+
+    succeeded = sum(1 for r in results if r["success"])
+    return {
+        "total": len(body.deal_ids),
+        "succeeded": succeeded,
+        "failed": len(body.deal_ids) - succeeded,
+        "results": results,
+    }
+
+
+@router.post("/admin/bulk/retry-payouts")
+async def admin_bulk_retry_payouts(
+    request: Request,
+    body: BulkRetryPayoutsRequest = None,
+    x_admin_key: Optional[str] = Header(None),
+    x_admin_pubkey: Optional[str] = Header(None),
+):
+    """
+    Retry failed payouts for multiple deals.
+
+    If deal_ids is omitted, retries all deals with failed payouts.
+    Each retry is independent — failures don't affect others.
+    """
+    verify_admin(x_admin_key, x_admin_pubkey)
+
+    if body and body.deal_ids:
+        deal_ids = body.deal_ids
+    else:
+        failed_deals = deal_storage.get_deals_with_failed_payouts()
+        deal_ids = [d['deal_id'] for d in failed_deals]
+
+    if not deal_ids:
+        return {"total": 0, "succeeded": 0, "failed": 0, "results": [], "message": "No failed payouts found"}
+
+    log_admin_action("bulk_retry_payouts", f"{len(deal_ids)} deals", request)
+
+    from backend.api.routes._payout import execute_fedimint_payout
+
+    results = []
+    for deal_id in deal_ids:
+        try:
+            deal = deal_storage.get_deal_by_id(deal_id)
+            if not deal:
+                results.append({"deal_id": deal_id, "success": False, "error": "Deal not found"})
+                continue
+
+            # Determine payout type from deal state
+            if deal.get('payout_status') == 'failed' and deal.get('seller_payout_invoice'):
+                payout_type = "release"
+            elif deal.get('buyer_payout_status') == 'failed' and deal.get('buyer_payout_invoice'):
+                payout_type = "refund"
+            else:
+                results.append({"deal_id": deal_id, "success": False, "error": "No failed payout to retry"})
+                continue
+
+            await execute_fedimint_payout(
+                deal=deal,
+                payout_type=payout_type,
+                timeout_claim=True,
+            )
+            results.append({"deal_id": deal_id, "success": True, "payout_type": payout_type})
+        except Exception as e:
+            results.append({"deal_id": deal_id, "success": False, "error": str(e)})
+
+    succeeded = sum(1 for r in results if r["success"])
+    return {
+        "total": len(deal_ids),
+        "succeeded": succeeded,
+        "failed": len(deal_ids) - succeeded,
+        "results": results,
+    }
 
 

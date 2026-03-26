@@ -233,3 +233,29 @@ class DealModel(Base):
         return f"<Deal {self.deal_id[:8]} status={self.status} price={self.price_sats}>"
 
 
+class WebhookModel(Base):
+    """Registered webhook endpoint for deal event notifications."""
+    __tablename__ = 'webhooks'
+
+    id = Column(String(16), primary_key=True)
+    url = Column(String(500), nullable=False)
+    secret = Column(String(200), nullable=True)
+    events = Column(Text, nullable=False, default='["*"]')  # JSON list
+    active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+
+    def to_dict(self, redact_secret: bool = True) -> dict:
+        import json
+        return {
+            'id': self.id,
+            'url': self.url,
+            'secret': '***' if redact_secret and self.secret else self.secret,
+            'events': json.loads(self.events) if self.events else ['*'],
+            'active': self.active,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+    def __repr__(self):
+        return f"<Webhook {self.id} url={self.url}>"
+
+

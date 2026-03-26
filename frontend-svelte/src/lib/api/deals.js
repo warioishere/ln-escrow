@@ -18,3 +18,15 @@ export async function getDealByToken(token) {
 export async function getSigningStatus(dealId) {
 	return request(`/deals/${dealId}/signing-status`);
 }
+
+export async function deleteDeal(dealId, userId, signature, timestamp) {
+	return request(`/deals/${dealId}`, {
+		method: 'DELETE',
+		body: JSON.stringify({ user_id: userId, signature, timestamp })
+	});
+}
+
+export async function getPayoutStatus(dealId) {
+	return request(`/deals/${dealId}/payout-status`);
+}
+

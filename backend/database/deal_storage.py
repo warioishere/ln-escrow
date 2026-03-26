@@ -479,6 +479,60 @@ def get_deal_stats() -> dict:
         }
 
 
+def search_deals(
+    title: str = None,
+    status_filter: str = None,
+    min_sats: int = None,
+    max_sats: int = None,
+    created_after: str = None,
+    created_before: str = None,
+    limit: int = 50,
+) -> list[dict]:
+    """
+    Search deals with filters (admin use).
+
+    Args:
+        title: Substring match on deal title (case-insensitive).
+        status_filter: Exact status match (e.g. 'funded', 'disputed').
+        min_sats: Minimum price_sats (inclusive).
+        max_sats: Maximum price_sats (inclusive).
+        created_after: ISO datetime string — only deals created after this time.
+        created_before: ISO datetime string — only deals created before this time.
+        limit: Max results (capped at 500).
+    """
+    from datetime import datetime as dt, timezone as tz
+
+    with get_db_session() as db:
+        query = db.query(DealModel)
+
+        if title:
+            query = query.filter(DealModel.title.ilike(f'%{title}%'))
+        if status_filter:
+            valid_statuses = {s.value for s in DealStatus}
+            if status_filter not in valid_statuses:
+                raise ValueError(f"Invalid status: {status_filter}. Valid: {valid_statuses}")
+            query = query.filter(DealModel.status == status_filter)
+        if min_sats is not None:
+            query = query.filter(DealModel.price_sats >= min_sats)
+        if max_sats is not None:
+            query = query.filter(DealModel.price_sats <= max_sats)
+        if created_after:
+            try:
+                after_dt = dt.fromisoformat(created_after).replace(tzinfo=tz.utc)
+            except ValueError:
+                raise ValueError(f"Invalid created_after datetime: {created_after}")
+            query = query.filter(DealModel.created_at >= after_dt)
+        if created_before:
+            try:
+                before_dt = dt.fromisoformat(created_before).replace(tzinfo=tz.utc)
+            except ValueError:
+                raise ValueError(f"Invalid created_before datetime: {created_before}")
+            query = query.filter(DealModel.created_at <= before_dt)
+
+        deals = query.order_by(DealModel.created_at.desc()).limit(min(limit, 500)).all()
+        return [d.to_dict() for d in deals]
+
+
 def find_deals_by_linking_pubkey(linking_pubkey: str, limit: int = 50) -> list[dict]:
     """
     Find all deals where the user participated (by their LNURL linking pubkey)

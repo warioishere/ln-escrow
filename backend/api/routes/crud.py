@@ -1,10 +1,10 @@
 """
-Deal CRUD endpoints: create, list, get, join, cancel, stats.
+Deal CRUD endpoints: create, list, get, join, cancel, delete, search, stats, payout-status
 """
 import logging
 import os
 from typing import Optional
-from fastapi import APIRouter, Request, HTTPException, status
+from fastapi import APIRouter, Request, HTTPException, Header, status
 from datetime import datetime, timezone
 
 from backend.database import deal_storage
@@ -14,7 +14,7 @@ from backend.database.settings import get_limits
 from backend.config import CONFIG
 
 from backend.api.routes._shared import (
-    _ws_notify, deal_to_response, _verify_deal_signature,
+    _ws_notify, deal_to_response, _verify_deal_signature, verify_admin,
     CreateDealRequest, JoinDealRequest, SignedActionRequest,
     DealResponse, DealListResponse, DealStatsResponse,
 )
@@ -25,8 +25,12 @@ router = APIRouter()
 
 
 @router.get("/stats", response_model=DealStatsResponse)
-async def deal_stats():
-    """Get deal statistics"""
+async def deal_stats(
+    x_admin_key: Optional[str] = Header(None),
+    x_admin_pubkey: Optional[str] = Header(None),
+):
+    """Get deal statistics (admin only)."""
+    verify_admin(x_admin_key, x_admin_pubkey)
     try:
         stats = deal_storage.get_deal_stats()
         return DealStatsResponse(**stats)
@@ -156,6 +160,46 @@ async def get_deal_by_token(token: str):
     return deal_to_response(deal)
 
 
+@router.get("/search")
+async def search_deals(
+    title: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    min_sats: Optional[int] = None,
+    max_sats: Optional[int] = None,
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+    limit: int = 50,
+    x_admin_key: Optional[str] = Header(None),
+    x_admin_pubkey: Optional[str] = Header(None),
+):
+    """
+    Search and filter deals (admin only).
+
+    Supports filtering by title (substring), status, amount range, and date range.
+    """
+    verify_admin(x_admin_key, x_admin_pubkey)
+
+    if limit > 500:
+        limit = 500
+
+    try:
+        deals = deal_storage.search_deals(
+            title=title,
+            status_filter=status_filter,
+            min_sats=min_sats,
+            max_sats=max_sats,
+            created_after=created_after,
+            created_before=created_before,
+            limit=limit,
+        )
+        return {"deals": deals, "count": len(deals)}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        logger.error("Search failed: %s", e)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Search failed")
+
+
 @router.get("/{deal_id}", response_model=DealResponse)
 async def get_deal(deal_id: str):
     """Get deal by ID"""
@@ -248,6 +292,61 @@ async def cancel_deal(deal_id: str, body: SignedActionRequest):
     deal_storage.set_deal_status(deal_id, DealStatus.CANCELLED.value)
 
     return {"success": True, "message": "Deal cancelled"}
+
+
+@router.delete("/{deal_id}")
+async def delete_deal(deal_id: str, body: SignedActionRequest):
+    """
+    Delete an unfunded deal (pending, active, or cancelled only).
+
+    Permanently removes the deal from the database. Only the deal creator
+    can delete. Funded deals cannot be deleted (use cancel instead).
+    """
+    deal = deal_storage.get_deal_by_id(deal_id)
+    if not deal:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deal not found")
+
+    creator_role = deal.get('creator_role', 'seller')
+    creator_id = deal['seller_id'] if creator_role == 'seller' else deal['buyer_id']
+    if creator_id != body.user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only deal creator can delete")
+
+    _verify_deal_signature(deal, creator_role, "delete", body.timestamp, body.signature, deal_id)
+
+    try:
+        deal_storage.delete_deal(deal_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    return {"success": True, "message": "Deal deleted"}
+
+
+@router.get("/{deal_id}/payout-status")
+async def get_payout_status(deal_id: str):
+    """
+    Get payout status for a deal.
+
+    Returns the current state of both seller (release) and buyer (refund) payouts
+    without returning the full deal object.
+    """
+    deal = deal_storage.get_deal_by_id(deal_id)
+    if not deal:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Deal not found")
+
+    return {
+        "deal_id": deal_id,
+        "status": deal['status'],
+        "seller_payout": {
+            "has_invoice": bool(deal.get('seller_payout_invoice')),
+            "payout_status": deal.get('payout_status'),
+            "paid": deal.get('payout_status') == 'paid',
+        },
+        "buyer_payout": {
+            "has_invoice": bool(deal.get('buyer_payout_invoice')),
+            "payout_status": deal.get('buyer_payout_status'),
+            "paid": deal.get('buyer_payout_status') == 'paid',
+        },
+    }
 
 
 @router.get("/{deal_id}/recovery-info")
